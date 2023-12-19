@@ -1,9 +1,3 @@
-/*
- desc: 	
- author: interma (interma@outlook.com)
- created: 06/17/16 17:04:52 HKT
-*/
-
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

@@ -18,7 +18,7 @@ hashtable *hashtable_new(int size){
 
 int hashtable_hash(hashtable *ht, char *key){
         
-            unsigned long int hashval;
+            unsigned long int hashval=0;
             int i = 0;
             // Convert our string to an integer
             while (hashval < ULONG_MAX && i < strlen(key)) {
@@ -44,8 +44,8 @@ hashtable_element *hashtable_newpair(char *key, char*value){
 
 // insert a key-value pair into a hash table
 
-void hashtable_set(hashtable *ht, char *key, char *value){
-        
+int hashtable_set(hashtable *ht, char *key, char *value){
+        //return O if insert is successful and -1 if not
             int bin = 0;
             hashtable_element *newpair = NULL;
             hashtable_element *next = NULL;
@@ -61,6 +61,7 @@ void hashtable_set(hashtable *ht, char *key, char *value){
                 free(next->value);
                 next->value = value;
                 // Nope, could't find it.  Time to grow a pair.
+                return -1;
             } else {
                 newpair = hashtable_newpair(key, value);
                 // We're at the start of the linked list in this bin.
@@ -76,6 +77,8 @@ void hashtable_set(hashtable *ht, char *key, char *value){
                     last->next = newpair;
                 }
             }
+
+            return 0;
 
 
 }
@@ -111,8 +114,8 @@ char* hashtable_get(hashtable *ht, char *key){
 
 // delete a key-value pair from a hash table
 
-void hashtable_delete(hashtable *ht, char *key){
-            
+int hashtable_delete(hashtable *ht, char *key){
+            //return O if delete is successful and -1 if not
                 int bin = 0;
                 hashtable_element *pair;
                 hashtable_element *last;
@@ -128,12 +131,13 @@ void hashtable_delete(hashtable *ht, char *key){
                     ht->table[bin] = pair->next;
                 } else if (pair == NULL) {
                     // Nope, couldn't find it.
-                    return;
+                    return -1;
                 } else {
                     // Found it.
                     last->next = pair->next;
                 }
                 //hashtable_element_free(pair);
+                return 0;
 }
 
 // print the contents of the hash table
@@ -145,7 +149,7 @@ void hashtable_print(hashtable *ht){
                     for (i = 0; i < ht->size; i++) {
                         pair = ht->table[i];
                         while (pair != NULL && pair->key != NULL) {
-                            printf("%s => %s\n", pair->key, (char *)pair->value);
+                            printf("%s,%s\n", pair->key, (char *)pair->value);
                             pair = pair->next;
                         }
                     }
@@ -187,6 +191,23 @@ void hashtable_element_free(hashtable_element *he){
 }
 
 
+
+int find_h(hashtable *ht, char *key){
+    int bin = 0;
+    hashtable_element *pair;
+    bin = hashtable_hash(ht, key);
+    // Step through the bin, looking for our value.
+    pair = ht->table[bin];
+    while (pair != NULL && pair->key != NULL && strcmp(key, pair->key) > 0) {
+        pair = pair->next;
+    }
+    // Did we actually find anything?
+    if (pair == NULL || pair->key == NULL || strcmp(key, pair->key) != 0) {
+        return 0;
+    } else {
+        return 1;
+    }
+}
 
 
 

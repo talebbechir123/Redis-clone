@@ -42,15 +42,17 @@ hashtable_element *hashtable_newpair(char *key, char *value);
 
 // insert a key-value pair into a hash table
 
-void hashtable_set(hashtable *ht, char *key, char *value);
+int hashtable_set(hashtable *ht, char *key, char *value);
 
 // retrieve a key-value pair from a hash table
 char* hashtable_get(hashtable *ht, char *key);
 
 
+int find_h(hashtable *ht, char *key);
+
 // delete a key-value pair from a hash table
 
-void hashtable_delete(hashtable *ht, char *key);
+int hashtable_delete(hashtable *ht, char *key);
 
 // print the contents of the hash table
 

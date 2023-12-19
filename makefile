@@ -7,55 +7,42 @@ FILES=  main.c server.c server.h
 
 OBJDIR=obj
 
+SRCDIR=src
+
+INCDIR=include
 # create a directory 
 
 
-all: server client test server_thread server2 clean_obj 
+all: server client test DB
 
 
-test.o: src/test.c include/hashtable.h include/replication.h
-	$(CC) $(CFLAGS) $(OFLAGS) -c src/test.c
+test.o: $(SRCDIR)/test.c $(INCDIR)/hashtable.h $(INCDIR)/replication.h
+	$(CC) $(CFLAGS) $(OFLAGS) -c $(SRCDIR)/test.c
 
 
 test: test.o hashtable.o replication.o
 	$(CC) $(CFLAGS) $(OFLAGS) -o test test.o hashtable.o replication.o
 
-replication.o: src/replication.c include/replication.h
-	$(CC) $(CFLAGS) $(OFLAGS) -c src/replication.c
-server_thread.o: src/server_thread.c include/server.h include/replication.h
-	$(CC) $(CFLAGS) $(OFLAGS) -c src/server_thread.c
+replication.o: $(SRCDIR)/replication.c $(INCDIR)/replication.h
+	$(CC) $(CFLAGS) $(OFLAGS) -c $(SRCDIR)/replication.c
 
-server_thread: server_thread.o hashtable.o resp.o replication.o
-	$(CC) $(CFLAGS) $(OFLAGS) -o server_thread server_thread.o hashtable.o resp.o replication.o
+hashtable.o: $(SRCDIR)/hashtable.c $(INCDIR)/hashtable.h
+	$(CC) $(CFLAGS) $(OFLAGS) -c $(SRCDIR)/hashtable.c
 
-server2.o: src/server2.c include/server.h include/hashtable.h include/replication.h
-	$(CC) $(CFLAGS) $(OFLAGS) -c src/server2.c
-
-server2: server2.o hashtable.o resp.o replication.o
-	$(CC) $(CFLAGS) $(OFLAGS) -o server2 server2.o hashtable.o resp.o replication.o
-hashtable.o: src/hashtable.c include/hashtable.h
-	$(CC) $(CFLAGS) $(OFLAGS) -c src/hashtable.c
-
-server.o: server.c include/server.h include/hashtable.h include/replication.h
+server.o: server.c $(INCDIR)/server.h $(INCDIR)/hashtable.h $(INCDIR)/replication.h
 	$(CC) $(CFLAGS) $(OFLAGS) -c server.c
 
 server: server.o hashtable.o resp.o replication.o
 	$(CC) $(CFLAGS) $(OFLAGS) -o server server.o hashtable.o resp.o replication.o
 
-resp.o: src/resp.c include/resp.h
-	$(CC) $(CFLAGS) $(OFLAGS) -c src/resp.c
+resp.o: $(SRCDIR)/resp.c $(INCDIR)/resp.h
+	$(CC) $(CFLAGS) $(OFLAGS) -c $(SRCDIR)/resp.c
 # client.h is in the include path
-client.o: src/client.c include/server.h 
-	$(CC) $(CFLAGS) $(OFLAGS) -c src/client.c
-
-
-
-clean_obj:
-	rm -f *.o 
-
-
-
-
+client.o: $(SRCDIR)/client.c $(INCDIR)/server.h 
+	$(CC) $(CFLAGS) $(OFLAGS) -c $(SRCDIR)/client.c
+#create a client executable htDB directory if it does not exist
+DB:
+	mkdir -p htDB
 clean:
-	rm -f main *.o *~ *# *.gch *.swp *.out server client test server_thread server2
+	rm -f main *.o *~ *# *.gch *.swp *.out server client test server_thread server2 htDB/*.txt
 

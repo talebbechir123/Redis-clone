@@ -1,9 +1,3 @@
-/*
- desc: 	
- author: interma (interma@outlook.com)
- created: 06/17/16 17:04:56 HKT
-*/
-
 #ifndef __interma_RESP_H
 #define __interma_RESP_H
 

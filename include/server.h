@@ -35,7 +35,7 @@
 
 
 
-#define MAXCLIENTS 10
+#define MAXCLIENTS 100
 
 
 

@@ -1,8 +1,0 @@
-1 => tama
-2 => tama
-3 => tama
-4 => tama
-5 => tama
-6 => tama
-7 => tama
-8 => tama

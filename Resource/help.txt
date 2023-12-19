@@ -1,0 +1,12 @@
+#Help menu
+#help returns a list of commands
+#set <key> <value> sets a key to a value
+#get <key> returns <value>
+#del <key> deletes a key
+#ping returns pong
+#SAVE saves the database to disk
+#COPY <filename> copies the database to a file
+#EXISTS <key> returns 1 if the key exists, 0 if not
+#Echo <message> returns <message>
+#INFO returns information about the database
+
