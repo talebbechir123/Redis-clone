@@ -1,8 +1,8 @@
 ### AISE project report
-### Group members
--1 Ahmed taleb BECHIR
 
--2 Valentin DENIS
+Ahmed taleb BECHIR
+
+
 
 ### Implementation choices
 
