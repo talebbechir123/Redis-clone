@@ -4,81 +4,70 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 #include <stdint.h>
-#include <math.h>
+#include <time.h>
 
-#define ULONG_MAX 4294967295UL
-
-
-// implementation of a hashtable element
-typedef struct hashtable_element
-{
+typedef struct hashtable_element {
     char *key;
     char *value;
+    time_t expire_at;   /* 0 = never expires */
     struct hashtable_element *next;
 } hashtable_element;
 
-// implementation of a hashtable
-
-typedef struct hashtable
-{
+typedef struct hashtable {
     int size;
     int count;
     hashtable_element **table;
 } hashtable;
 
-// create a new hashtable
+hashtable  *hashtable_new(int size);
+void        hashtable_free(hashtable *ht);
+void        hashtable_flush(hashtable *ht);
+void        hashtable_element_free(hashtable_element *he);
 
-hashtable *hashtable_new(int size);
+uint32_t    hashtable_hash(hashtable *ht, const char *key);
 
-// hash a string for a particular hash table
+/* Set (upsert). expire_at=0 means no expiry.
+   Returns 0=inserted, 1=updated, -1=error. */
+int   hashtable_set(hashtable *ht, const char *key, const char *value, time_t expire_at);
 
-int hashtable_hash(hashtable *ht, char *key);
+/* Set only if key does not exist.
+   Returns 0=inserted, -1=key already exists, -2=error. */
+int   hashtable_setnx(hashtable *ht, const char *key, const char *value, time_t expire_at);
 
-// create a key-value pair
+/* Returns value string or NULL (key missing / expired). */
+char *hashtable_get(hashtable *ht, const char *key);
 
-hashtable_element *hashtable_newpair(char *key, char *value);
+/* Returns 0=deleted, -1=not found. */
+int   hashtable_delete(hashtable *ht, const char *key);
 
-// insert a key-value pair into a hash table
+/* Set or replace TTL. Returns 0=ok, -1=key not found. */
+int   hashtable_expire(hashtable *ht, const char *key, int seconds);
 
-int hashtable_set(hashtable *ht, char *key, char *value);
+/* Remove TTL from key. Returns 0=ok, -1=key not found / no TTL. */
+int   hashtable_persist(hashtable *ht, const char *key);
 
-// retrieve a key-value pair from a hash table
-char* hashtable_get(hashtable *ht, char *key);
+/* Returns remaining seconds, -1=no TTL, -2=key not found. */
+long  hashtable_ttl(hashtable *ht, const char *key);
 
+/* Increment numeric value by delta. Stores result in *out.
+   Returns 0=ok, -1=key not integer, -2=error. */
+int   hashtable_incr(hashtable *ht, const char *key, long delta, long *out);
 
-int find_h(hashtable *ht, char *key);
+/* Append suffix to value. Stores new length in *new_len.
+   Returns 0=ok, -1=error. */
+int   hashtable_append(hashtable *ht, const char *key, const char *suffix, size_t *new_len);
 
-// delete a key-value pair from a hash table
+/* Return NULL-terminated array of matching key strings.
+   Caller must free each string and the array itself.
+   Pattern: "*" = all, otherwise simple fnmatch with * wildcard. */
+char **hashtable_keys(hashtable *ht, const char *pattern, int *count);
 
-int hashtable_delete(hashtable *ht, char *key);
+int   hashtable_count(hashtable *ht);
 
-// print the contents of the hash table
+/* Evict all expired keys and return the number removed. */
+int   hashtable_evict_expired(hashtable *ht);
 
-void hashtable_print(hashtable *ht);
-
-
-// free the memory allocated for a hash table
-
-void hashtable_free(hashtable *ht);
-
-// free the memory allocated for a hash table element
-
-void hashtable_element_free(hashtable_element *he);
-
-
-
-
-
-
-
-
-
-
-
-
-
+void  hashtable_print(hashtable *ht);
 
 #endif
-

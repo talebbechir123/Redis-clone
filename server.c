@@ -1,489 +1,631 @@
 #include "include/server.h"
 #include "include/resp.h"
+#include "include/replication.h"
+
+#include <sys/epoll.h>
 #include <fcntl.h>
 #include <signal.h>
-#include "include/replication.h"
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
-#define BUF_SIZE 1024
+#include <strings.h>   /* strcasecmp */
+#include <ctype.h>
+#include <stdarg.h>
 
-int REPLICATION_INTERVAL =100;
-int HashINSERTS = 0;
-//database save flag 0 = no save, 1 = save
-int DATABASE_SAVE_FLAG =0;
+#define BUF_SIZE         4096
+#define MAX_EVENTS       256
+#define EXPIRE_INTERVAL  5    /* seconds between passive TTL sweeps */
 
+/* ------------------------------------------------------------------ globals */
 
+static volatile sig_atomic_t g_save_flag = 0;
+static int g_repl_interval = 100;    /* save every N inserts */
+static int g_insert_count  = 0;
 
+/* ------------------------------------------------------------------ logging */
 
-// function that returns the current time
-char* GetTimestamp()
-{
-	time_t rawtime;
-	struct tm* timeinfo;
-
-	time(&rawtime);
-	timeinfo = localtime(&rawtime);
-	char* time = asctime(timeinfo);
-
-	char* newLine = strstr(time, "\n");
-	if (newLine)
-	{
-		*newLine = 0;
-	}
-
-	return time;
+static void log_info(const char *fmt, ...) {
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+    printf("[%s] INFO  ", ts);
+    va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+    putchar('\n');
 }
 
-void save_db(hashtable* ht){
-    char* timestamp = GetTimestamp();
-        printf("Timestamp: %s\n", timestamp);
-        char* filename = malloc(strlen("htDB/hashtable_") + strlen(timestamp) + strlen(".txt") + 1);
-        strcpy(filename, "htDB/hashtable_");
-        strcat(filename, timestamp);
-        strcat(filename, ".txt");
-        printf("Filename: %s\n", filename);
-        hashtable_replicate(ht, filename);
+/* ------------------------------------------------------------------ per-client state */
+
+typedef struct {
+    int          fd;
+    RespRequest *req;
+    RespResponse *res;
+    char         addr[INET_ADDRSTRLEN];
+} client_t;
+
+static client_t *client_new(int fd, const char *addr) {
+    client_t *c = malloc(sizeof(client_t));
+    if (!c) return NULL;
+    c->fd  = fd;
+    c->req = create_request(BUF_SIZE);
+    c->res = create_response(BUF_SIZE);
+    if (!c->req || !c->res) { free(c); return NULL; }
+    snprintf(c->addr, sizeof(c->addr), "%s", addr);
+    return c;
 }
 
-//function that initializes that loads the help menu from a file so that it can be printed to the client
-int help_init(char* help){
-    FILE *fp;
-    char* line = NULL;
-    size_t len = 0;
-    ssize_t read;
-    //help is in the Resource folder
-    fp = fopen("Resource/help.txt", "r");
-    if(fp == NULL){
-        printf("Error opening file\n");
-        exit(EXIT_FAILURE);
-    }
-    while((read = getline(&line, &len, fp)) != -1){
-        strcat(help, line);
-    }
-    fclose(fp);
-    if(line){
-        free(line);
-    }
-    return strlen(help);
+static void client_free(client_t *c) {
+    if (!c) return;
+    destroy_request(c->req);
+    destroy_response(c->res);
+    free(c);
 }
 
+/* ------------------------------------------------------------------ signal */
 
-//function that gives us the status of the hashtable
-int info_init(char* info, hashtable* ht){
-    char* timestamp = GetTimestamp();
-    char* filename = malloc(strlen("htDB/hashtable_") + strlen(timestamp) + strlen(".txt") + 1);
-    strcpy(filename, "htDB/hashtable_");
-    strcat(filename, timestamp);
-    strcat(filename, ".txt");
-    hashtable_replicate(ht, filename);
-    FILE *fp;
-    char* line = NULL;
-    size_t len = 0;
-    ssize_t read;
-    //help is in the Resource folder
-    fp = fopen(filename, "r");
-    if(fp == NULL){
-        printf("Error opening file\n");
-        exit(EXIT_FAILURE);
-    }
-    while((read = getline(&line, &len, fp)) != -1){
-        strcat(info, line);
-    }
-    fclose(fp);
-    if(line){
-        free(line);
-    }
-    return strlen(info);
+static void sig_handler(int signo) {
+    if (signo == SIGUSR1) g_save_flag = 1;
 }
 
+/* ------------------------------------------------------------------ helpers */
 
+static void set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
-
-int server_init(int port){
-    int socket_fd;
-    struct sockaddr_in server_addr;
+int server_init(int port) {
+    int fd;
+    struct sockaddr_in addr;
     int opt = 1;
 
-    if((socket_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0){
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
+    if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) { perror("socket"); exit(1); }
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    set_nonblocking(fd);
 
-    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR , &opt, sizeof(opt))){
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-    fcntl(socket_fd, F_SETFL, O_NONBLOCK);
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
 
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(port);
-
-    if(bind(socket_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0){
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-    printf("Server listening on port %d\n", port);
-
-
-
-    return socket_fd;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); exit(1); }
+    return fd;
 }
 
+static void save_db(hashtable *ht) {
+    char path[256];
+    time_t now  = time(NULL);
+    struct tm *tm = localtime(&now);
+    char ts[64];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", tm);
+    snprintf(path, sizeof(path), "htDB/snapshot_%s.db", ts);
+    hashtable_replicate(ht, path);
+    log_info("snapshot saved -> %s (%d keys)", path, hashtable_count(ht));
+}
 
-//function that handles the request from the client 
-int request_handler(char * request, hashtable *ht,char* buf, int rnum, RespRequest *req, RespResponse *res){
-     // return 0 if decode is successful and -1 if not
-     int result_decode ;
-		if ((result_decode = decode_request(req, buf, rnum)) == 0 && 
-			(req->state == OK || req->state == PART_OK) ){
-			if (req->argc > 1 && strncmp(request_argv(req,0), "add", 3) == 0) {
-				int total = 0;
-				for (int i = 1; i < req->argc; i++)
-					total += atoi(request_argv(req,i));
-				result_decode= encode_response_integer(res, total);
-			}else if (req->argc > 1 && strncmp(request_argv(req,0), "set", 3) == 0) {
-                // set returns 0 if insert is successful and -1 if not
-                //if DATABASE_SAVE_FLAG is 1 then save the database
-        
-                int result = hashtable_set(ht, request_argv(req,1), request_argv(req,2));
-                if(result == 0){
-                   result_decode= encode_response_status(res,1,"OK");
-                   printf("HashINSERTS: %d\n", HashINSERTS);
-                     HashINSERTS++;
-                      printf("HashINSERTS: %d\n", HashINSERTS);
-                if(HashINSERTS == REPLICATION_INTERVAL){
-                    raise(SIGUSR1);
-                    HashINSERTS = REPLICATION_INTERVAL;
-                }
-                }else if(result == -1){
-                 result_decode=encode_response_status(res,0,"ERR key already exists");
-                }
-             
-               // encode_response_status(res,1,"OK");
-               
-                //raise(SIGUSR1);
-            }else if (req->argc ==1 && strncmp(request_argv(req,0), "PING", 3) == 0) {
-                encode_response_status(res,1,"PONG");
-            }else if (req->argc ==2 && strncmp(request_argv(req,0), "get", 3) == 0) {
-                 // get the value from the hashtable of the key
-                 // key is the second argument
-                char* key = request_argv(req,1);
-               printf("Key: %s\n", key);
-               char *value = hashtable_get(ht, key);
-               //check if the value is null
-                if(value == NULL){
-                result_decode=encode_response_status(res,0,"ERR key does not exist");
-                     return result_decode;
-                }else {
-                      printf("Value: %s\n", value);
-                // 
-              result_decode=  encode_response_string(res, hashtable_get(ht, key), strlen(hashtable_get(ht, key)));
-                }
-            }else if (req->argc ==1 && strncmp(request_argv(req,0), "QUIT", 3) == 0) {
-               result_decode= encode_response_status(res,1,"OK");
-                exit(EXIT_SUCCESS);
-               
-            
-			}else if (req->argc ==2 && strncmp(request_argv(req,0), "DEL", 3) == 0) {
-               //if delete is successful hastable_delete returns 0
-                //if delete is unsuccessful hashtable_delete returns -1
+/* ------------------------------------------------------------------ command dispatch */
 
-                int result = hashtable_delete(ht, request_argv(req,1));
-                if(result == 0){
-                 result_decode=   encode_response_status(res,1,"OK");
-                }else if(result == -1){
-                  result_decode=  encode_response_status(res,0,"ERR key does not exist");
-                }
-               
-            
-            } else if(req->argc ==1 && strncmp(request_argv(req,0), "TIME", 4) == 0){
-                time_t rawtime;
-                struct tm * timeinfo;
-                time ( &rawtime );
-                timeinfo = localtime ( &rawtime );
-                char* time = asctime(timeinfo);
-                char* newLine = strstr(time, "\n");
-                if (newLine)
-                {
-                    *newLine = 0;
-                }
-              result_decode=  encode_response_string(res, time, strlen(time));
-            
-            }else if (req->argc ==1 && strncmp(request_argv(req,0), "SAVE", 4) == 0) {
-                //save the database
-                save_db(ht);
-                result_decode= encode_response_status(res,1,"OK");
-            
-            }else if (req->argc ==1 && strncmp(request_argv(req,0), "RESTORE", 7) == 0) {
-                //restore the database
-                hashtable_restore();
-                result_decode= encode_response_status(res,1,"OK");
-            }else if (req->argc ==2 && strncmp(request_argv(req,0), "COPY",3) == 0) {
-                //copy the database to a file
-                char* filename = request_argv(req,1);
-                hashtable_replicate(ht, filename);
-                result_decode= encode_response_status(res,1,"OK");
-            
-           }else if (req->argc ==2 && strncmp(request_argv(req,0), "EXISTS",5) == 0) {
-            //check if the key exists
-            //if the key exists return 1
-            //if the key does not exist return 0
-            char* key = request_argv(req,1);
-            int result = find_h(ht,key);
-            if(result == 1){
-                result_decode= encode_response_status(res,1,"OK");
-            }else if(result == 0){
-                result_decode= encode_response_status(res,0,"ERR key does not exist");
+/*
+ * Returns 0 on success, -1 on encode failure.
+ * Writes response into c->res.
+ */
+static int handle_command(client_t *c, hashtable *ht) {
+    RespRequest  *req = c->req;
+    RespResponse *res = c->res;
+
+    if (req->state != OK && req->state != PART_OK)
+        return encode_response_status(res, 0, "ERR bad request");
+
+    if (req->argc == 0)
+        return encode_response_status(res, 0, "ERR empty command");
+
+    const char *cmd = request_argv(req, 0);
+
+    /* ---- PING ---- */
+    if (strcasecmp(cmd, "PING") == 0) {
+        if (req->argc >= 2)
+            return encode_response_string(res, request_argv(req, 1),
+                                          strlen(request_argv(req, 1)));
+        return encode_response_status(res, 1, "PONG");
+    }
+
+    /* ---- ECHO ---- */
+    if (strcasecmp(cmd, "ECHO") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        const char *msg = request_argv(req, 1);
+        return encode_response_string(res, msg, strlen(msg));
+    }
+
+    /* ---- QUIT ---- */
+    if (strcasecmp(cmd, "QUIT") == 0) {
+        encode_response_status(res, 1, "OK");
+        return 1;  /* signal caller to close */
+    }
+
+    /* ---- SET key value [EX seconds] ---- */
+    if (strcasecmp(cmd, "SET") == 0) {
+        if (req->argc < 3) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        const char *key = request_argv(req, 1);
+        const char *val = request_argv(req, 2);
+        time_t expire_at = 0;
+
+        /* Parse optional [EX seconds] */
+        for (int i = 3; i < req->argc - 1; i++) {
+            if (strcasecmp(request_argv(req, i), "EX") == 0) {
+                int secs = atoi(request_argv(req, i + 1));
+                if (secs <= 0) return encode_response_status(res, 0, "ERR invalid expire time");
+                expire_at = time(NULL) + secs;
+                i++;
             }
-            
-           } else if (req->argc ==1 && strncmp(request_argv(req,0), "--HELP",5) == 0) {
+        }
+        int r = hashtable_set(ht, key, val, expire_at);
+        if (r == -1) return encode_response_status(res, 0, "ERR out of memory");
+        if (r == 0) {
+            g_insert_count++;
+            if (g_insert_count >= g_repl_interval) {
+                raise(SIGUSR1);
+                g_insert_count = 0;
+            }
+        }
+        return encode_response_status(res, 1, "OK");
+    }
 
-            //print the help menu
-            //print the commands and their descriptions
-            //print the arguments and their descriptions
-            char help[1024];
-            int help_size = help_init(help);
-            result_decode= encode_response_string(res, help, help_size);            
-           }else if (req->argc ==2 && strncmp(request_argv(req,0), "ECHO",3) == 0) {
+    /* ---- SETNX key value ---- */
+    if (strcasecmp(cmd, "SETNX") == 0) {
+        if (req->argc < 3) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        int r = hashtable_setnx(ht, request_argv(req, 1), request_argv(req, 2), 0);
+        return encode_response_integer(res, r == 0 ? 1 : 0);
+    }
 
-            //echo the argument back to the client
-            //print the argument to the server console
-            char* echo = request_argv(req,1);
-            printf("Echo: %s\n", echo);
-            result_decode= encode_response_string(res, echo, strlen(echo));
-           }else if (req->argc ==1 && strncmp(request_argv(req,0), "INFO",3) == 0) {
-                
-                char info[1024];
-                int info_size = info_init(info, ht);
-                result_decode= encode_response_string(res, info, info_size);
-            
-           }else {
-				result_decode= encode_response_status(res,0,"ERR unknown command");
-			}
-		}
-		else {
+    /* ---- SETEX key seconds value ---- */
+    if (strcasecmp(cmd, "SETEX") == 0) {
+        if (req->argc < 4) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        int secs = atoi(request_argv(req, 2));
+        if (secs <= 0) return encode_response_status(res, 0, "ERR invalid expire time");
+        time_t exp = time(NULL) + secs;
+        int r = hashtable_set(ht, request_argv(req, 1), request_argv(req, 3), exp);
+        if (r == -1) return encode_response_status(res, 0, "ERR out of memory");
+        return encode_response_status(res, 1, "OK");
+    }
 
-			result_decode=encode_response_status(res,0,"ERR decode command fail");
-		}
+    /* ---- GET key ---- */
+    if (strcasecmp(cmd, "GET") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        char *val = hashtable_get(ht, request_argv(req, 1));
+        if (!val) return encode_response_status(res, 0, "ERR key does not exist");
+        return encode_response_string(res, val, strlen(val));
+    }
 
-        return result_decode;
-   
+    /* ---- GETSET key value ---- */
+    if (strcasecmp(cmd, "GETSET") == 0) {
+        if (req->argc < 3) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        char *old = hashtable_get(ht, request_argv(req, 1));
+        int r;
+        if (old) {
+            char *copy = strdup(old);
+            r = hashtable_set(ht, request_argv(req, 1), request_argv(req, 2), 0);
+            if (r != -1) { encode_response_string(res, copy, strlen(copy)); }
+            else           encode_response_status(res, 0, "ERR out of memory");
+            free(copy);
+            return r == -1 ? -1 : 0;
+        }
+        hashtable_set(ht, request_argv(req, 1), request_argv(req, 2), 0);
+        return encode_response_status(res, 0, "ERR key does not exist");
+    }
+
+    /* ---- GETDEL key ---- */
+    if (strcasecmp(cmd, "GETDEL") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        char *val = hashtable_get(ht, request_argv(req, 1));
+        if (!val) return encode_response_status(res, 0, "ERR key does not exist");
+        char *copy = strdup(val);
+        hashtable_delete(ht, request_argv(req, 1));
+        encode_response_string(res, copy, strlen(copy));
+        free(copy);
+        return 0;
+    }
+
+    /* ---- DEL key [key ...] ---- */
+    if (strcasecmp(cmd, "DEL") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        int deleted = 0;
+        for (int i = 1; i < req->argc; i++)
+            if (hashtable_delete(ht, request_argv(req, i)) == 0) deleted++;
+        return encode_response_integer(res, deleted);
+    }
+
+    /* ---- EXISTS key [key ...] ---- */
+    if (strcasecmp(cmd, "EXISTS") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        int found = 0;
+        for (int i = 1; i < req->argc; i++)
+            if (hashtable_get(ht, request_argv(req, i)) != NULL) found++;
+        return encode_response_integer(res, found);
+    }
+
+    /* ---- INCR key ---- */
+    if (strcasecmp(cmd, "INCR") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        long result;
+        int r = hashtable_incr(ht, request_argv(req, 1), 1, &result);
+        if (r == -1) return encode_response_status(res, 0, "ERR value is not an integer");
+        return encode_response_integer(res, (int)result);
+    }
+
+    /* ---- INCRBY key amount ---- */
+    if (strcasecmp(cmd, "INCRBY") == 0) {
+        if (req->argc < 3) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        long delta = atol(request_argv(req, 2));
+        long result;
+        int r = hashtable_incr(ht, request_argv(req, 1), delta, &result);
+        if (r == -1) return encode_response_status(res, 0, "ERR value is not an integer");
+        return encode_response_integer(res, (int)result);
+    }
+
+    /* ---- DECR key ---- */
+    if (strcasecmp(cmd, "DECR") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        long result;
+        int r = hashtable_incr(ht, request_argv(req, 1), -1, &result);
+        if (r == -1) return encode_response_status(res, 0, "ERR value is not an integer");
+        return encode_response_integer(res, (int)result);
+    }
+
+    /* ---- DECRBY key amount ---- */
+    if (strcasecmp(cmd, "DECRBY") == 0) {
+        if (req->argc < 3) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        long delta = atol(request_argv(req, 2));
+        long result;
+        int r = hashtable_incr(ht, request_argv(req, 1), -delta, &result);
+        if (r == -1) return encode_response_status(res, 0, "ERR value is not an integer");
+        return encode_response_integer(res, (int)result);
+    }
+
+    /* ---- APPEND key value ---- */
+    if (strcasecmp(cmd, "APPEND") == 0) {
+        if (req->argc < 3) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        size_t new_len;
+        int r = hashtable_append(ht, request_argv(req, 1), request_argv(req, 2), &new_len);
+        if (r == -1) return encode_response_status(res, 0, "ERR out of memory");
+        return encode_response_integer(res, (int)new_len);
+    }
+
+    /* ---- STRLEN key ---- */
+    if (strcasecmp(cmd, "STRLEN") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        char *val = hashtable_get(ht, request_argv(req, 1));
+        return encode_response_integer(res, val ? (int)strlen(val) : 0);
+    }
+
+    /* ---- MSET key value [key value ...] ---- */
+    if (strcasecmp(cmd, "MSET") == 0) {
+        if (req->argc < 3 || (req->argc % 2) == 0)
+            return encode_response_status(res, 0, "ERR wrong number of arguments");
+        for (int i = 1; i < req->argc; i += 2)
+            hashtable_set(ht, request_argv(req, i), request_argv(req, i + 1), 0);
+        return encode_response_status(res, 1, "OK");
+    }
+
+    /* ---- MGET key [key ...] ---- */
+    if (strcasecmp(cmd, "MGET") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        int n = req->argc - 1;
+        encode_response_array(res, n);
+        for (int i = 1; i <= n; i++) {
+            char *val = hashtable_get(ht, request_argv(req, i));
+            if (val) encode_response_string(res, val, strlen(val));
+            else     encode_response_status(res, 0, "nil");
+        }
+        return 0;
+    }
+
+    /* ---- RENAME key newkey ---- */
+    if (strcasecmp(cmd, "RENAME") == 0) {
+        if (req->argc < 3) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        char *val = hashtable_get(ht, request_argv(req, 1));
+        if (!val)  return encode_response_status(res, 0, "ERR no such key");
+        long ttl = hashtable_ttl(ht, request_argv(req, 1));
+        time_t exp = (ttl >= 0) ? time(NULL) + ttl : 0;
+        char *copy = strdup(val);
+        hashtable_delete(ht, request_argv(req, 1));
+        hashtable_set(ht, request_argv(req, 2), copy, exp);
+        free(copy);
+        return encode_response_status(res, 1, "OK");
+    }
+
+    /* ---- TYPE key ---- */
+    if (strcasecmp(cmd, "TYPE") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        char *val = hashtable_get(ht, request_argv(req, 1));
+        return encode_response_status(res, 1, val ? "string" : "none");
+    }
+
+    /* ---- EXPIRE key seconds ---- */
+    if (strcasecmp(cmd, "EXPIRE") == 0) {
+        if (req->argc < 3) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        int secs = atoi(request_argv(req, 2));
+        if (secs <= 0) return encode_response_status(res, 0, "ERR invalid expire time");
+        int r = hashtable_expire(ht, request_argv(req, 1), secs);
+        return encode_response_integer(res, r == 0 ? 1 : 0);
+    }
+
+    /* ---- EXPIREAT key timestamp ---- */
+    if (strcasecmp(cmd, "EXPIREAT") == 0) {
+        if (req->argc < 3) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        long ts = atol(request_argv(req, 2));
+        if (ts <= (long)time(NULL)) return encode_response_integer(res, 0);
+        /* Use expire with calculated delta */
+        int delta = (int)(ts - (long)time(NULL));
+        int r = hashtable_expire(ht, request_argv(req, 1), delta);
+        return encode_response_integer(res, r == 0 ? 1 : 0);
+    }
+
+    /* ---- TTL key ---- */
+    if (strcasecmp(cmd, "TTL") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        long ttl = hashtable_ttl(ht, request_argv(req, 1));
+        return encode_response_integer(res, (int)ttl);
+    }
+
+    /* ---- PERSIST key ---- */
+    if (strcasecmp(cmd, "PERSIST") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        int r = hashtable_persist(ht, request_argv(req, 1));
+        return encode_response_integer(res, r == 0 ? 1 : 0);
+    }
+
+    /* ---- KEYS pattern ---- */
+    if (strcasecmp(cmd, "KEYS") == 0) {
+        const char *pat = (req->argc >= 2) ? request_argv(req, 1) : "*";
+        int count;
+        char **keys = hashtable_keys(ht, pat, &count);
+        encode_response_array(res, count);
+        for (int i = 0; i < count; i++) {
+            encode_response_string(res, keys[i], strlen(keys[i]));
+            free(keys[i]);
+        }
+        free(keys);
+        return 0;
+    }
+
+    /* ---- DBSIZE ---- */
+    if (strcasecmp(cmd, "DBSIZE") == 0)
+        return encode_response_integer(res, hashtable_count(ht));
+
+    /* ---- FLUSHDB ---- */
+    if (strcasecmp(cmd, "FLUSHDB") == 0) {
+        hashtable_flush(ht);
+        return encode_response_status(res, 1, "OK");
+    }
+
+    /* ---- TIME ---- */
+    if (strcasecmp(cmd, "TIME") == 0) {
+        char buf[64];
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm);
+        return encode_response_string(res, buf, strlen(buf));
+    }
+
+    /* ---- SAVE ---- */
+    if (strcasecmp(cmd, "SAVE") == 0) {
+        save_db(ht);
+        return encode_response_status(res, 1, "OK");
+    }
+
+    /* ---- COPY filename ---- */
+    if (strcasecmp(cmd, "COPY") == 0) {
+        if (req->argc < 2) return encode_response_status(res, 0, "ERR wrong number of arguments");
+        hashtable_replicate(ht, request_argv(req, 1));
+        return encode_response_status(res, 1, "OK");
+    }
+
+    /* ---- INFO ---- */
+    if (strcasecmp(cmd, "INFO") == 0) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "keys:%d\r\nrepl_interval:%d\r\ninsert_count:%d\r\n",
+                 hashtable_count(ht), g_repl_interval, g_insert_count);
+        return encode_response_string(res, buf, strlen(buf));
+    }
+
+    /* ---- HELP ---- */
+    if (strcasecmp(cmd, "HELP") == 0 || strcasecmp(cmd, "--HELP") == 0) {
+        static const char help[] =
+            "Commands:\r\n"
+            "  SET key value [EX seconds]\r\n"
+            "  SETNX key value\r\n"
+            "  SETEX key seconds value\r\n"
+            "  GET key\r\n"
+            "  GETSET key value\r\n"
+            "  GETDEL key\r\n"
+            "  DEL key [key ...]\r\n"
+            "  EXISTS key [key ...]\r\n"
+            "  INCR key\r\n"
+            "  INCRBY key amount\r\n"
+            "  DECR key\r\n"
+            "  DECRBY key amount\r\n"
+            "  APPEND key value\r\n"
+            "  STRLEN key\r\n"
+            "  MSET key value [key value ...]\r\n"
+            "  MGET key [key ...]\r\n"
+            "  RENAME key newkey\r\n"
+            "  TYPE key\r\n"
+            "  EXPIRE key seconds\r\n"
+            "  EXPIREAT key timestamp\r\n"
+            "  TTL key\r\n"
+            "  PERSIST key\r\n"
+            "  KEYS pattern\r\n"
+            "  DBSIZE\r\n"
+            "  FLUSHDB\r\n"
+            "  PING [message]\r\n"
+            "  ECHO message\r\n"
+            "  TIME\r\n"
+            "  INFO\r\n"
+            "  SAVE\r\n"
+            "  COPY filename\r\n"
+            "  QUIT\r\n";
+        return encode_response_string(res, help, strlen(help));
+    }
+
+    return encode_response_status(res, 0, "ERR unknown command");
 }
 
+/* ------------------------------------------------------------------ main */
 
-
-//create a signal that will export the hashtable to a file every 10 inserts
-void sig_handler(int signo){
-    //turn arg into a hashtable
-    //hashtable *ht = (hashtable *)arg;
-    if(signo == SIGUSR1){
-       // turn the database save flag to 1
-      //
-      DATABASE_SAVE_FLAG = 1;
-    }
-}
-
-int main(int argc , char **argv){
-
-    if(argc != 3){
-        printf("Usage: ./server <port> <replication interval>\n");
-        exit(EXIT_FAILURE);
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <port> [repl_interval]\n", argv[0]);
+        return 1;
     }
 
-    int PORT = atoi(argv[1]);
-    REPLICATION_INTERVAL = atoi(argv[2]);
-    int socket_fd; 
-    int CLIENTS[MAXCLIENTS];
-    hashtable* ht;
-   // int client_count = 0;
-    int max_fd;
-    fd_set read_fds;
-    //fd_set write_fds;
-   // fd_set except_fds;
-    struct timeval tv;
-    //create a directory for the hashtable files
-   int result = mkdir("htDB", 0777);
-    if(result == -1){
-         printf("Error creating directory\n");
-         if (errno == EEXIST){
-             printf("Directory already exists\n");
-         }else{
-             printf("Error creating directory\n");
-             exit(EXIT_FAILURE);
-         }
+    int port = atoi(argv[1]);
+    if (argc >= 3) g_repl_interval = atoi(argv[2]);
 
-    }else if(result == 0){
-        printf("Directory created\n");
+    /* Ensure htDB directory exists */
+    if (mkdir("htDB", 0777) == -1 && errno != EEXIST) {
+        perror("mkdir htDB"); return 1;
     }
-    //how to check for errno EEXIST
 
-    //initialize server socket
-    socket_fd = server_init(PORT);
+    /* Signal setup */
+    struct sigaction sa = {0};
+    sa.sa_handler = sig_handler;
+    sigaction(SIGUSR1, &sa, NULL);
 
-    //listen for connections
-    if(listen(socket_fd, MAXCLIENTS) < 0){
-        perror("listen");
-        exit(EXIT_FAILURE);
+    /* Auto-restore latest snapshot (no blocking stdin prompt) */
+    hashtable *ht = hashtable_restore();
+    log_info("database loaded: %d keys", hashtable_count(ht));
+
+    /* Server socket */
+    int server_fd = server_init(port);
+    if (listen(server_fd, SOMAXCONN) < 0) { perror("listen"); return 1; }
+    log_info("listening on port %d", port);
+
+    /* epoll setup */
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) { perror("epoll_create1"); return 1; }
+
+    struct epoll_event ev = {0};
+    ev.events   = EPOLLIN;
+    ev.data.fd  = server_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
+        perror("epoll_ctl"); return 1;
     }
-    // do you want to restore the previous hashtable?
-    printf("Do you want to restore the previous hashtable? (y/n)\n");
-    char answer;
-    scanf("%c", &answer);
-    if(answer == 'y'){
-        printf("Restoring previous hashtable\n");
-        ht =hashtable_restore();
-    }else if(answer == 'n'){
-        printf("Creating new hashtable\n");
-        ht = hashtable_new(65536);
-    }else{
-        printf("Invalid input\n");
-        exit(EXIT_FAILURE);
-    }
-    //initialize the hashtable
-    //ht = hashtable_new(65536);
-   //  ht =hashtable_restore();
-   // if(ht == NULL){
-      // printf("ht is empty\n");
-       // ht = hashtable_new(65536);
-   // }
-    //accept connections
-     socklen_t addrlen = sizeof(struct sockaddr_in);
-    struct sigaction act;
-    act.sa_handler = sig_handler;
-    sigemptyset(&act.sa_mask);
-    act.sa_flags = 0;
-    sigaction(SIGUSR1, &act, NULL);
-    RespRequest *req = create_request(BUF_SIZE);
-	RespResponse *res = create_response(BUF_SIZE);
-    //// Set up file descriptors for select()
-    FD_ZERO(&read_fds);
-    FD_SET(socket_fd, &read_fds);
-    max_fd = socket_fd;
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;
 
+    struct epoll_event events[MAX_EVENTS];
+    time_t last_expire_sweep = time(NULL);
 
+    log_info("server ready (repl_interval=%d)", g_repl_interval);
 
-	while (1) {
-
-        while (DATABASE_SAVE_FLAG == 0){
-
-        
-
-        // Wait for incoming connections or data
-        fd_set tmp_fds = read_fds;
-        int ret = select(max_fd+1, &tmp_fds, NULL, NULL, &tv);
-        if (ret < 0) {
-            perror("select()");
-            exit(EXIT_FAILURE);
-        } else if (ret == 0) {
-            // Timeout
-            continue;
+    while (1) {
+        /* Use a 1-second timeout so we can run periodic tasks */
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+        if (nfds < 0) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait");
+            break;
         }
 
-        
-		reset_request(req);
-		reset_response(res);	
-         // Handle incoming connections
-        if (FD_ISSET(socket_fd, &tmp_fds)) {
-            int client_socket;
-            struct sockaddr_in client_address;
-           // int client_address_length = sizeof(client_address);
-            client_socket = accept(socket_fd, (struct sockaddr*) &client_address, &addrlen);
-            if (client_socket < 0) {
-                perror("accept()");
+        /* Periodic: save if signal raised */
+        if (g_save_flag) {
+            save_db(ht);
+            g_save_flag = 0;
+        }
+
+        /* Periodic: passive TTL sweep */
+        time_t now = time(NULL);
+        if (now - last_expire_sweep >= EXPIRE_INTERVAL) {
+            int evicted = hashtable_evict_expired(ht);
+            if (evicted > 0) log_info("TTL sweep evicted %d keys", evicted);
+            last_expire_sweep = now;
+        }
+
+        for (int i = 0; i < nfds; i++) {
+            int fd = events[i].data.fd;
+
+            /* New connection */
+            if (fd == server_fd) {
+                struct sockaddr_in client_addr;
+                socklen_t addrlen = sizeof(client_addr);
+                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
+                if (client_fd < 0) {
+                    if (errno != EAGAIN) perror("accept");
+                    continue;
+                }
+                set_nonblocking(client_fd);
+
+                char addr_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &client_addr.sin_addr, addr_str, sizeof(addr_str));
+
+                client_t *client = client_new(client_fd, addr_str);
+                if (!client) { close(client_fd); continue; }
+
+                struct epoll_event cev = {0};
+                cev.events    = EPOLLIN | EPOLLET;
+                cev.data.ptr  = client;
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
+                    perror("epoll_ctl add client");
+                    client_free(client);
+                    close(client_fd);
+                    continue;
+                }
+                log_info("client connected: %s (fd=%d)", addr_str, client_fd);
                 continue;
             }
-            printf("new client connected socket :%d\n", client_socket);
-            FD_SET(client_socket, &read_fds);
-            // add client socket to array of sockets
-            for(int i = 0; i < MAXCLIENTS; i++){
-                if(CLIENTS[i] == 0){
-                   CLIENTS[i] = client_socket;
+
+            /* Data from existing client */
+            client_t *client = (client_t *)events[i].data.ptr;
+
+            /* Handle disconnection or error */
+            if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+                log_info("client disconnected: %s (fd=%d)", client->addr, client->fd);
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+                close(client->fd);
+                client_free(client);
+                continue;
+            }
+
+            /* Read loop (edge-triggered: read until EAGAIN) */
+            int close_conn = 0;
+            while (!close_conn) {
+                char buf[BUF_SIZE];
+                ssize_t rnum = read(client->fd, buf, sizeof(buf));
+
+                if (rnum < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                        close_conn = 1;
                     break;
                 }
+                if (rnum == 0) { close_conn = 1; break; }
+
+                reset_request(client->req);
+                reset_response(client->res);
+
+                if (decode_request(client->req, buf, (uint32_t)rnum) != 0) {
+                    encode_response_status(client->res, 0, "ERR parse error");
+                } else {
+                    int cmd_result = handle_command(client, ht);
+                    if (cmd_result == 1) close_conn = 1;  /* QUIT */
+                }
+
+                /* Write response */
+                ssize_t wnum = write(client->fd, client->res->buf, client->res->used_size);
+                if (wnum < 0) { close_conn = 1; break; }
             }
-            // Add client socket to read_fds
-           
-           if (client_socket > max_fd) {
-               max_fd = client_socket;
-           }
-        }
 
-        // Handle client data
-        // Handle incoming data
-        for (int i = 0; i <MAXCLIENTS ; i++) {
-            reset_request(req);
-		    reset_response(res);
-            if (FD_ISSET(i, &tmp_fds)) {
-               // printf("Handling data on socket %d\n", max_fd);
-                char buf[1024];
-                // read the request from the client
-                int rnum = read(i,buf,sizeof(buf));
-                if (rnum < 0) {
-                    perror("read()");
-                    continue;
-                }else if (rnum == 0) {
-                   break;
-                }
-
-               // printf("rnum: %d\n", rnum);
-               int request_result = request_handler(buf, ht, buf, rnum, req, res);
-                // printf("request_result: %d\n", request_result);
-                if(request_result == -1){
-                    perror("request_handler()");
-                    continue;
-                }
-                    //printf("request_result: %d\n", request_result);
-                int num = write(i, res->buf, res->used_size);
-                    if (num < 0) {
-                        perror("write()");
-                        continue;
-                    }else if (num == 0) {
-                        break;
-                    }
-               
-                //write the response to the client
-
-               
-
-                //if quit, close the connection
-                if (strncmp(buf, "QUIT", 4) == 0) {
-                    close(i);
-                    FD_CLR(i, &read_fds);
-                    for(int j = 0; j < MAXCLIENTS; j++){
-                        if(CLIENTS[j] == i){
-                            CLIENTS[j] = 0;
-                            break;
-                        }
-                    }
-                }
-            
+            if (close_conn) {
+                log_info("client disconnected: %s (fd=%d)", client->addr, client->fd);
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+                close(client->fd);
+                client_free(client);
             }
-        }
-
-  }
-    //save the database
-    save_db(ht);
-
-  DATABASE_SAVE_FLAG = 0;
-		
-	}
-	destroy_request(req);
-	destroy_response(res);
-    //close all sockets
-    for(int i = 0; i < MAXCLIENTS; i++){
-        if(CLIENTS[i] != 0){
-            close(CLIENTS[i]);
         }
     }
 
-	close(socket_fd);
-
-
-return 0;
+    /* Cleanup */
+    save_db(ht);
+    hashtable_free(ht);
+    close(epoll_fd);
+    close(server_fd);
+    return 0;
 }
-
