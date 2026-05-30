@@ -1,4 +1,4 @@
-# pASE1 — Redis-Compatible In-Memory Key-Value Server
+# Redis-clone— Redis-Compatible In-Memory Key-Value Server
 
 A high-performance, Redis-compatible in-memory key-value store written in C.
 Implements the [RESP protocol](https://redis.io/docs/reference/protocol-spec/), meaning it works out of the box with `redis-cli` and any Redis client library.
