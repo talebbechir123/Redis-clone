@@ -1,9 +1,9 @@
-# Redis-clone— Redis-Compatible In-Memory Key-Value Server
+# Redis Clone — Redis-Compatible In-Memory Key-Value Server in C
 
 A high-performance, Redis-compatible in-memory key-value store written in C.
 Implements the [RESP protocol](https://redis.io/docs/reference/protocol-spec/), meaning it works out of the box with `redis-cli` and any Redis client library.
 
-**Author:** Ahmed Taleb Bechir
+**Author:** Ahmed Taleb Bechir · French project report: [readme_fr.md](readme_fr.md)
 
 ---
 
@@ -17,7 +17,7 @@ Implements the [RESP protocol](https://redis.io/docs/reference/protocol-spec/), 
 - **25+ commands** — full string, numeric, bulk, and TTL command set
 - **Case-insensitive commands** — `SET`, `set`, `Set` all work
 - **FNV-1a hash** — excellent key distribution, low collision rate
-- **Zero compiler warnings** — built with `-Wall -Wextra`
+- **Clean build** — compiles with zero warnings under `-Wall -Wextra`
 
 ---
 
@@ -30,7 +30,7 @@ make client   # client only
 make clean    # remove compiled artifacts
 ```
 
-**Requirements:** GCC, Linux (uses `epoll`)
+**Requirements:** GCC, Linux (uses `epoll`). Create the snapshot directory once with `make DB`.
 
 ---
 
@@ -141,7 +141,7 @@ On startup the server finds the most recently modified file in `htDB/` and resto
 ## Project Structure
 
 ```
-pASE1/
+redis-clone/
 ├── server.c              # Main server: epoll loop, command dispatch
 ├── include/
 │   ├── server.h          # Server declarations and macros
@@ -153,6 +153,7 @@ pASE1/
 │   ├── resp.c            # RESP encoder / decoder
 │   ├── replication.c     # Snapshot save and restore
 │   └── client.c          # Interactive RESP client
+├── alt/                  # Earlier prototypes (threaded and select-based servers)
 ├── htDB/                 # Runtime snapshot directory (gitignored)
 └── makefile
 ```
@@ -167,3 +168,10 @@ pASE1/
 - [epoll — Linux manual page](https://man7.org/linux/man-pages/man7/epoll.7.html)
 - [Redis Command Reference](https://redis.io/commands/)
 - [RESP C implementation reference](https://github.com/interma/RESP)
+
+---
+
+## Author
+
+**Ahmed Taleb Bechir**
+[atbechir.com](https://atbechir.com) · [LinkedIn](https://www.linkedin.com/in/ahmed-taleb-bechir-97a7301a4) · [GitHub](https://github.com/talebbechir123)
